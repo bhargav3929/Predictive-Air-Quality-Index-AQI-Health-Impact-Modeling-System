@@ -1,32 +1,42 @@
-"""Groq-only LLM client with automatic model fallback and a circuit breaker."""
+"""Groq-only LLM client: timeout, retries with backoff, model fallback, plain-English errors."""
 import asyncio
 import json
+import logging
+import random
 import re
 import time
 
 import httpx
 
-GROQ_MODELS = ["openai/gpt-oss-120b", "qwen/qwen3.8-27b", "llama-3.3-70b-versatile"]
-BREAKER_SECONDS = 120
+from . import config
+
+log = logging.getLogger("aeropulse.llm")
+URL = "https://api.groq.com/openai/v1/chat/completions"
 MAX_TOKENS = 900
+TIMEOUT = 40.0
+RETRY_STATUS = {429, 500, 502, 503, 504}
 
-_breaker: dict[str, float] = {}
+MESSAGES = {
+    "AI_NOT_CONFIGURED": "No Groq key is set. Open API Keys and paste a free key from console.groq.com/keys.",
+    "AI_KEY_INVALID": "Your Groq key was rejected. Open API Keys and paste a fresh key from console.groq.com/keys.",
+    "AI_BUSY": "The AI service is busy right now. Wait a minute and try again.",
+    "AI_FAILED": "The AI couldn't process this input.",
+}
 
 
-class LLMUnavailable(Exception):
-    pass
+class LLMError(Exception):
+    def __init__(self, code: str, detail: str = ""):
+        super().__init__(detail or code)
+        self.code = code
+        self.message = MESSAGES[code]
 
 
-def _open(provider: str) -> bool:
-    return _breaker.get(provider, 0) > time.time()
-
-
-def _trip(provider: str):
-    _breaker[provider] = time.time() + BREAKER_SECONDS
+def _clean(text: str, key: str) -> str:
+    return text.replace(key, "***") if key else text
 
 
 def _parse_json(text: str) -> dict:
-    text = (text or "").strip()
+    text = re.sub(r"<think>.*?</think>", "", text or "", flags=re.S).strip()
     text = re.sub(r"^```(?:json)?|```$", "", text, flags=re.M).strip()
     try:
         return json.loads(text)
@@ -37,46 +47,69 @@ def _parse_json(text: str) -> dict:
         return json.loads(m.group(0))
 
 
-async def _groq(client: httpx.AsyncClient, key: str, system: str, prompt: str):
-    last = None
-    for idx, model in enumerate(GROQ_MODELS):
-        body = {
-            "model": model,
-            "messages": [{"role": "system", "content": system}, {"role": "user", "content": prompt}],
-            "max_tokens": MAX_TOKENS,
-            "temperature": 0.3,
-            "response_format": {"type": "json_object"},
-        }
-        if "gpt-oss" in model:
-            body["reasoning_effort"] = "low"
+def _wait_hint(resp: httpx.Response, attempt: int) -> float:
+    m = re.search(r"try again in ([\d.]+)s", resp.text or "")
+    if m and float(m.group(1)) <= 20:
+        return float(m.group(1))
+    return 2 ** attempt + random.random()
+
+
+async def _call_model(client, key, model, system, prompt):
+    """Up to 3 attempts. Returns parsed JSON or raises LLMError."""
+    body = {
+        "model": model,
+        "messages": [{"role": "system", "content": system}, {"role": "user", "content": prompt}],
+        "max_tokens": MAX_TOKENS, "temperature": 0.3,
+        "response_format": {"type": "json_object"},
+    }
+    if "gpt-oss" in model:
+        body["reasoning_effort"] = "low"
+    bad_output = False
+    for attempt in range(3):
+        wait = 2 ** attempt + random.random()
         try:
-            r = await client.post(
-                "https://api.groq.com/openai/v1/chat/completions",
-                headers={"Authorization": f"Bearer {key}"},
-                json=body,
-            )
-            r.raise_for_status()
-            data = _parse_json(r.json()["choices"][0]["message"]["content"])
-            return {"data": data, "provider": "groq", "model": model, "fallback": idx > 0}
-        except Exception as e:  # try next model
-            last = e
-    raise last or RuntimeError("groq failed")
+            r = await client.post(URL, headers={"Authorization": f"Bearer {key}"}, json=body)
+        except (httpx.TimeoutException, httpx.TransportError) as e:
+            log.warning("groq %s attempt %d: %s", model, attempt + 1, type(e).__name__)
+            if attempt < 2:
+                await asyncio.sleep(wait)
+            continue
+        if r.status_code == 401:
+            raise LLMError("AI_KEY_INVALID", "401")
+        if r.status_code in RETRY_STATUS:
+            log.warning("groq %s attempt %d: HTTP %d", model, attempt + 1, r.status_code)
+            if attempt < 2:
+                await asyncio.sleep(_wait_hint(r, attempt) if r.status_code == 429 else wait)
+            continue
+        if r.status_code >= 400:  # 400 / 413 / other: do not retry
+            log.warning("groq %s: HTTP %d %s", model, r.status_code, _clean(r.text[:200], key))
+            raise LLMError("AI_FAILED", str(r.status_code))
+        try:
+            return _parse_json(r.json()["choices"][0]["message"]["content"])
+        except Exception:
+            if bad_output:
+                raise LLMError("AI_FAILED", "invalid output")
+            bad_output = True  # retry once on invalid output
+    raise LLMError("AI_BUSY", "retries exhausted")
 
 
-async def generate(system: str, prompt: str, keys: dict, timeout: float = 18.0) -> dict:
-    """Return {data, provider, model, fallback, latency_ms, attempts[]} or raise LLMUnavailable."""
+async def generate(system: str, prompt: str, key: str) -> dict:
+    """Return {data, provider, model, fallback, latency_ms} or raise LLMError."""
+    if not config.key_usable(key):
+        raise LLMError("AI_NOT_CONFIGURED")
     t0 = time.perf_counter()
-    groq_key = keys.get("GROQ_API_KEY")
-    if not groq_key or _open("groq"):
-        raise LLMUnavailable("no AI provider available (missing Groq key or circuit open)")
-    attempts = ["groq started +0ms"]
-    try:
-        async with httpx.AsyncClient(timeout=timeout) as client:
-            res = await asyncio.wait_for(_groq(client, groq_key, system, prompt), timeout)
-    except Exception as e:
-        _trip("groq")
-        attempts.append(f"groq failed: {type(e).__name__}")
-        raise LLMUnavailable("; ".join(attempts))
-    res["latency_ms"] = int((time.perf_counter() - t0) * 1000)
-    res["attempts"] = attempts
-    return res
+    models = [config.GROQ_MODEL]
+    if config.GROQ_FALLBACK_MODEL != config.GROQ_MODEL:
+        models.append(config.GROQ_FALLBACK_MODEL)
+    last = None
+    async with httpx.AsyncClient(timeout=TIMEOUT) as client:
+        for idx, model in enumerate(models):
+            try:
+                data = await _call_model(client, key, model, system, prompt)
+                return {"data": data, "provider": "groq", "model": model, "fallback": idx > 0,
+                        "latency_ms": int((time.perf_counter() - t0) * 1000)}
+            except LLMError as e:
+                if e.code == "AI_KEY_INVALID":
+                    raise
+                last = e
+    raise last or LLMError("AI_FAILED")

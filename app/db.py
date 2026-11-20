@@ -1,12 +1,13 @@
 """SQLite persistence: settings, sliding-window rate limiter, forecast history."""
 import json
-import os
 import sqlite3
 import time
 from pathlib import Path
 
 DB_PATH = Path(__file__).resolve().parent.parent / "aeropulse.db"
-RATE_LIMIT = 15
+from . import config
+
+RATE_LIMIT = config.HOURLY_QUOTA
 RATE_WINDOW = 3600
 
 
@@ -30,21 +31,27 @@ def init():
             created_at REAL NOT NULL,
             city TEXT, country TEXT, lat REAL, lon REAL,
             profile TEXT, us_aqi REAL, pm2_5 REAL, pm10 REAL, no2 REAL, o3 REAL,
-            payload TEXT NOT NULL
+            payload TEXT NOT NULL,
+            owner TEXT NOT NULL DEFAULT ''
         );
+        CREATE TABLE IF NOT EXISTS ticket_runs (tid TEXT PRIMARY KEY, runs INTEGER NOT NULL, first_ts REAL NOT NULL);
+        CREATE TABLE IF NOT EXISTS daily_runs (day TEXT PRIMARY KEY, runs INTEGER NOT NULL);
         """
     )
+    try:
+        c.execute("ALTER TABLE forecasts ADD COLUMN owner TEXT NOT NULL DEFAULT ''")
+    except sqlite3.OperationalError:
+        pass  # column already exists
     c.close()
+    cleanup()
 
 
-# ---- settings -------------------------------------------------------------
+# ---- settings (keys saved from the API Keys screen) ------------------------
 def get_setting(key: str) -> str:
     c = _conn()
     row = c.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
     c.close()
-    if row and row["value"]:
-        return row["value"]
-    return os.getenv(key, "") or ""
+    return (row["value"] if row and row["value"] else "")
 
 
 def set_setting(key: str, value: str):
@@ -56,8 +63,63 @@ def set_setting(key: str, value: str):
     c.close()
 
 
-def get_keys() -> dict:
-    return {k: get_setting(k) for k in ("GROQ_API_KEY",)}
+def delete_setting(key: str):
+    c = _conn()
+    c.execute("DELETE FROM settings WHERE key=?", (key,))
+    c.close()
+
+
+def resolve_groq_key():
+    """Return (key, source). Download: saved key, then env. Demo: env only."""
+    import os
+    if not config.DEMO_MODE:
+        saved = get_setting("GROQ_API_KEY")
+        if config.key_usable(saved):
+            return saved.strip(), "ui"
+    env = os.getenv("GROQ_API_KEY", "").strip()
+    if config.key_usable(env):
+        return env, "env"
+    return "", "none"
+
+
+# ---- demo run counting -------------------------------------------------------
+def _today():
+    return time.strftime("%Y-%m-%d", time.gmtime())
+
+
+def ticket_runs(tid: str) -> int:
+    c = _conn()
+    row = c.execute("SELECT runs FROM ticket_runs WHERE tid=?", (tid,)).fetchone()
+    c.close()
+    return row["runs"] if row else 0
+
+
+def daily_runs() -> int:
+    c = _conn()
+    row = c.execute("SELECT runs FROM daily_runs WHERE day=?", (_today(),)).fetchone()
+    c.close()
+    return row["runs"] if row else 0
+
+
+def record_run(tid: str):
+    """Call only after a live run succeeded."""
+    c = _conn()
+    c.execute("INSERT INTO ticket_runs(tid,runs,first_ts) VALUES(?,1,?) "
+              "ON CONFLICT(tid) DO UPDATE SET runs=runs+1", (tid, time.time()))
+    c.execute("INSERT INTO daily_runs(day,runs) VALUES(?,1) ON CONFLICT(day) DO UPDATE SET runs=runs+1", (_today(),))
+    c.close()
+
+
+def cleanup():
+    """Delete ticket rows and their history after 24 hours."""
+    cutoff = time.time() - 86400
+    c = _conn()
+    old = [r["tid"] for r in c.execute("SELECT tid FROM ticket_runs WHERE first_ts < ?", (cutoff,))]
+    for tid in old:
+        c.execute("DELETE FROM forecasts WHERE owner=?", (tid,))
+        c.execute("DELETE FROM ticket_runs WHERE tid=?", (tid,))
+    c.execute("DELETE FROM forecasts WHERE owner != '' AND created_at < ?", (cutoff,))
+    c.close()
 
 
 # ---- rate limiter ---------------------------------------------------------
@@ -104,23 +166,23 @@ def rate_refund(ip: str):
     c.close()
 
 
-def delete_forecast(fid: int):
+def delete_forecast(fid: int, owner: str = ""):
     c = _conn()
-    c.execute("DELETE FROM forecasts WHERE id=?", (fid,))
+    c.execute("DELETE FROM forecasts WHERE id=? AND owner=?", (fid, owner))
     c.close()
 
 
 # ---- forecasts ------------------------------------------------------------
-def save_forecast(result: dict) -> int:
+def save_forecast(result: dict, owner: str = "") -> int:
     loc, cur = result["location"], result["current"]
     c = _conn()
     cur_ = c.execute(
-        """INSERT INTO forecasts(created_at,city,country,lat,lon,profile,us_aqi,pm2_5,pm10,no2,o3,payload)
-           VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
+        """INSERT INTO forecasts(created_at,city,country,lat,lon,profile,us_aqi,pm2_5,pm10,no2,o3,payload,owner)
+           VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""",
         (
             time.time(), loc["name"], loc["country"], loc["lat"], loc["lon"], result["profile"],
             cur.get("us_aqi"), cur.get("pm2_5"), cur.get("pm10"), cur.get("no2"), cur.get("o3"),
-            json.dumps(result),
+            json.dumps(result), owner,
         ),
     )
     fid = cur_.lastrowid
@@ -128,19 +190,19 @@ def save_forecast(result: dict) -> int:
     return fid
 
 
-def list_forecasts(limit: int = 50):
+def list_forecasts(limit: int = 50, owner: str = ""):
     c = _conn()
     rows = c.execute(
-        "SELECT id,created_at,city,country,profile,us_aqi,pm2_5,pm10,no2 FROM forecasts ORDER BY id DESC LIMIT ?",
-        (limit,),
+        "SELECT id,created_at,city,country,profile,us_aqi,pm2_5,pm10,no2 FROM forecasts WHERE owner=? ORDER BY id DESC LIMIT ?",
+        (owner, limit),
     ).fetchall()
     c.close()
     return [dict(r) for r in rows]
 
 
-def get_forecast(fid: int):
+def get_forecast(fid: int, owner: str = ""):
     c = _conn()
-    row = c.execute("SELECT payload FROM forecasts WHERE id=?", (fid,)).fetchone()
+    row = c.execute("SELECT payload FROM forecasts WHERE id=? AND owner=?", (fid, owner)).fetchone()
     c.close()
     if not row:
         return None

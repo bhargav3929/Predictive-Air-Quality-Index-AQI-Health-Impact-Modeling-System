@@ -239,11 +239,18 @@ def risk_index(profile, cur, an):
 
 
 # ---------------- pipeline -------------------------------------------------
+_CODES = {"invalid_city": "BAD_INPUT", "city_not_found": "NOT_FOUND", "no_data": "NOT_FOUND",
+          "geocode_failed": "DATA_UNAVAILABLE", "telemetry_failed": "DATA_UNAVAILABLE"}
+
+
 def _ev(type_, **kw):
+    if type_ == "error":  # same {error, code} shape as every other error in the app
+        kw["code"] = _CODES.get(kw.get("code"), kw.get("code"))
+        kw["error"] = kw.get("message", "")
     return {"type": type_, "t": round(time.time(), 3), **kw}
 
 
-async def run(city: str, profile: str):
+async def run(city: str, profile: str, owner: str = "", key: str = ""):
     T0 = time.perf_counter()
     timings: dict = {}
     profile = profile if profile in PROFILES else PROFILES[0]
@@ -322,7 +329,7 @@ async def run(city: str, profile: str):
     yield _ev("node", node=4, name=NODES[4], status="running")
     t = time.perf_counter()
     fb = fallback_advisory(profile, cur, an)
-    provider = {"label": "Rules-based engine (no AI key configured)", "provider": "rules", "model": "deterministic", "fallback": False}
+    provider = {"label": "Rules-based engine (AI not used)", "provider": "rules", "model": "deterministic", "fallback": False}
     adv = fb
     summary = {
         "location": f"{loc['name']}, {loc['country']}", "profile": profile, "current": cur,
@@ -333,7 +340,7 @@ async def run(city: str, profile: str):
     }
     attempts = []
     try:
-        out = await llm.generate(SYSTEM, "Air quality data:\n" + json.dumps(summary), db.get_keys(), timeout=18.0)
+        out = await llm.generate(SYSTEM, "Air quality data:\n" + json.dumps(summary), key)
         d = out["data"]
         if isinstance(d, dict) and d.get("outdoor_activity"):
             adv = {k: d.get(k) or fb[k] for k in ADVISORY_KEYS}
@@ -341,13 +348,16 @@ async def run(city: str, profile: str):
                 adv["symptom_watch"] = fb["symptom_watch"]
             provider = {"label": f"{out['provider'].title()} · {out['model']}" + (" (fallback)" if out["fallback"] else ""),
                         "provider": out["provider"], "model": out["model"], "fallback": out["fallback"], "latency_ms": out["latency_ms"]}
-        attempts = out.get("attempts", [])
-    except llm.LLMUnavailable as e:
-        attempts = [str(e)]
-        provider["label"] = "Rules-based engine (AI unavailable: " + str(e)[:80] + ")"
+    except llm.LLMError as e:
+        attempts = [e.code]
+        provider["label"] = "Rules-based engine (" + e.message + ")"
+        provider["error_code"] = e.code
+        provider["error"] = e.message
     except Exception as e:
         attempts = [f"error {type(e).__name__}"]
-        provider["label"] = "Rules-based engine (AI error)"
+        provider["label"] = "Rules-based engine (" + llm.MESSAGES["AI_FAILED"] + ")"
+        provider["error_code"] = "AI_FAILED"
+        provider["error"] = llm.MESSAGES["AI_FAILED"]
     provider["attempts"] = attempts
     yield done(4, t, detail=provider["label"], provider=provider)
 
@@ -365,7 +375,7 @@ async def run(city: str, profile: str):
         "generated_at": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
     }
     result["brief_md"] = build_brief(result)
-    result["id"] = db.save_forecast(result)
+    result["id"] = db.save_forecast(result, owner)
     timings["total_ms"] = int((time.perf_counter() - T0) * 1000)
     result["timings"] = timings
     yield done(5, t, detail=f"Saved forecast #{result['id']} to aeropulse.db (WAL)")

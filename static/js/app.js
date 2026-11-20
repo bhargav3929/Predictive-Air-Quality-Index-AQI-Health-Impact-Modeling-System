@@ -9,6 +9,20 @@ const PRESETS = [
 const COLORS = { good: "#10B981", mod: "#F59E0B", sens: "#F97316", bad: "#EF4444", vbad: "#7E22CE" };
 const WHO = { pm2_5: 15, pm10: 45, no2: 25, o3: 100 };
 const EPA = { pm2_5: 35, pm10: 150, no2: 188, o3: 137 };
+/* ---------- demo ticket + API helper (all URLs are relative: the app may live under a sub-path) ---------- */
+let TICKET = "";
+try {
+  const q = new URLSearchParams(location.search);
+  if (q.get("ticket")) { sessionStorage.setItem("lastsem_ticket", q.get("ticket")); q.delete("ticket"); history.replaceState(null, "", location.pathname + (q.toString() ? "?" + q : "")); }
+  TICKET = sessionStorage.getItem("lastsem_ticket") || "";
+} catch { /* storage blocked: samples still work */ }
+function api(path, opts = {}) {
+  const headers = { ...(opts.headers || {}) };
+  if (TICKET) headers["X-LastSem-Ticket"] = TICKET;
+  return fetch(path, { ...opts, headers });
+}
+const apiJson = async (path, opts) => (await api(path, opts)).json();
+let INFO = null;
 let current = null, timerId = null, running = false, rawLog = [];
 
 const esc = (s) => String(s ?? "").replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
@@ -33,7 +47,7 @@ function switchView(v) {
 
 /* ---------- quota ---------- */
 async function loadQuota() {
-  try { setQuota((await (await fetch("/api/quota")).json()).remaining); } catch { /* ignore */ }
+  try { setQuota((await apiJson("api/quota")).remaining); } catch { /* ignore */ }
 }
 function setQuota(n) {
   const p = $("#quotaPill");
@@ -72,7 +86,13 @@ async function runForecast(city, profile) {
   const t0 = startTimer();
   let gotResult = false;
   try {
-    const res = await fetch("/api/forecast", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ city, profile }) });
+    const res = await api("api/forecast", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ city, profile }) });
+    if (!res.ok) {  // plain {error, code} JSON, e.g. quota reached or ticket problem
+      const e = await res.json().catch(() => ({ error: "Request failed.", code: "AI_FAILED" }));
+      showAlert(e.error, e.code === "RATE_LIMITED" || e.code.startsWith("TICKET") || e.code === "DAILY_CAP_REACHED" ? "" : "err");
+      if (e.code === "RATE_LIMITED") setQuota(0);
+      return;
+    }
     const reader = res.body.getReader(); const dec = new TextDecoder(); let buf = "";
     while (true) {
       const { value, done } = await reader.read();
@@ -88,10 +108,11 @@ async function runForecast(city, profile) {
         if (ev.type === "node") { state[ev.node] = { status: ev.status, ms: ev.ms }; renderPipeline(state); }
         else if (ev.type === "error") {
           if (ev.node) { state[ev.node] = { status: "err" }; renderPipeline(state); }
-          showAlert(ev.message, ev.code === "rate_limited" || ev.code === "city_not_found" || ev.code === "invalid_city" ? "" : "err");
-          if (ev.code === "rate_limited") setQuota(0);
+          showAlert(ev.error, ev.code === "NOT_FOUND" || ev.code === "BAD_INPUT" ? "" : "err");
         } else if (ev.type === "result") {
           gotResult = true; current = ev.data; render(ev.data);
+          const pe = ev.data.provider && ev.data.provider.error_code;
+          if (pe) showAlert(ev.data.provider.error + (pe === "AI_NOT_CONFIGURED" || pe === "AI_KEY_INVALID" ? "" : " A rules-based advisory is shown instead."), "");
         }
       }
     }
@@ -230,12 +251,12 @@ function renderLogs(r) {
 /* ---------- history ---------- */
 async function openHistory() {
   $("#drawer").classList.add("open"); $("#scrim").classList.remove("hidden");
-  const list = await (await fetch("/api/history")).json();
+  const list = await apiJson("api/history");
   $("#historyList").innerHTML = list.length ? list.map((h) => { const k = cat(h.us_aqi);
     return `<button class="hist" data-id="${h.id}"><span class="dot" style="background:${k.color}"></span><span><b>${esc(h.city)}, ${esc(h.country)}</b><br><span class="muted small">${esc(h.profile)} · ${new Date(h.created_at * 1000).toLocaleString()}</span></span><span class="mono">${fmt(h.us_aqi, 0)}</span><span class="del" data-del="${h.id}" title="Delete">×</span></button>`; }).join("") : '<p class="muted">No forecasts yet.</p>';
   document.querySelectorAll(".hist").forEach((b) => b.addEventListener("click", async (e) => {
-    if (e.target.dataset.del) { await fetch("/api/forecast/" + e.target.dataset.del, { method: "DELETE" }); openHistory(); return; }
-    current = await (await fetch("/api/forecast/" + b.dataset.id)).json(); closeDrawer(); switchView("forecast");
+    if (e.target.dataset.del) { await api("api/forecast/" + e.target.dataset.del, { method: "DELETE" }); openHistory(); return; }
+    current = await apiJson("api/forecast/" + b.dataset.id); closeDrawer(); switchView("forecast");
     $("#pipeline").classList.add("hidden"); $("#alert").classList.add("hidden"); render(current);
   }));
 }
@@ -245,7 +266,7 @@ $("#closeDrawer").addEventListener("click", closeDrawer); $("#scrim").addEventLi
 
 /* ---------- compare ---------- */
 async function loadCompareOptions() {
-  const list = await (await fetch("/api/history")).json();
+  const list = await apiJson("api/history");
   const opts = list.map((h) => `<option value="${h.id}">${esc(h.city)}, ${esc(h.country)} — AQI ${fmt(h.us_aqi, 0)} (${new Date(h.created_at * 1000).toLocaleTimeString()})</option>`).join("");
   $("#cmpA").innerHTML = opts; $("#cmpB").innerHTML = opts;
   if (list.length > 1) $("#cmpB").selectedIndex = 1;
@@ -253,7 +274,7 @@ async function loadCompareOptions() {
 $("#btnCompare").addEventListener("click", async () => {
   const a = $("#cmpA").value, b = $("#cmpB").value;
   if (!a || !b) { $("#cmpOut").innerHTML = '<div class="alert">Run at least two forecasts first.</div>'; return; }
-  const d = await (await fetch(`/api/compare?a=${a}&b=${b}`)).json();
+  const d = await apiJson(`api/compare?a=${a}&b=${b}`);
   overlay(a, b);
   const side = (f) => { const k = cat(f.current.us_aqi); return `<div class="card cmpCity"><h3>${esc(f.location.name)}, ${esc(f.location.country)}</h3><div class="muted small">${esc(f.profile)}</div><div class="big" style="color:${k.color}">${fmt(f.current.us_aqi, 0)}</div><span class="badge" style="background:${k.color}">${k.label}</span><p class="small muted">Driver: ${esc(f.analysis.dominant.label)} · Trend: ${f.analysis.trend.label}</p></div>`; };
   const rows = [["US AQI", "us_aqi", 0], ["PM2.5 (µg/m³)", "pm2_5", 1], ["PM10 (µg/m³)", "pm10", 1], ["NO₂ (µg/m³)", "no2", 1], ["O₃ (µg/m³)", "o3", 1]]
@@ -263,7 +284,7 @@ $("#btnCompare").addEventListener("click", async () => {
 });
 
 async function overlay(a, b) {
-  const [fa, fb] = await Promise.all([a, b].map(async (id) => (await fetch("/api/forecast/" + id)).json()));
+  const [fa, fb] = await Promise.all([a, b].map(async (id) => (await api("api/forecast/" + id)).json()));
   const W = 900, H = 240, ml = 40, mr = 14, mt = 12, mb = 24, n = Math.max(fa.series.time.length, fb.series.time.length);
   const mx = Math.max(150, ...fa.series.us_aqi.map((v) => v || 0), ...fb.series.us_aqi.map((v) => v || 0)) * 1.1;
   const x = (i) => ml + (i / (n - 1)) * (W - ml - mr), y = (v) => mt + (1 - v / mx) * (H - mt - mb);
@@ -287,26 +308,56 @@ $("#btnDownload").addEventListener("click", () => {
   a.download = `aeropulse-brief-${current.location.name.toLowerCase().replace(/\W+/g, "-")}.md`; a.click(); URL.revokeObjectURL(a.href);
 });
 
-/* ---------- keys modal ---------- */
+/* ---------- keys modal (download version only) ---------- */
 async function openKeys() {
-  const s = await (await fetch("/api/settings")).json();
-  $("#groqHint").textContent = s.GROQ_API_KEY.set ? `(saved ${s.GROQ_API_KEY.hint})` : "(not set)";
-  $("#kGroq").value = ""; $("#keysModal").classList.remove("hidden");
+  const res = await api("api/keys");
+  if (!res.ok) return;
+  const g = (await res.json()).groq;
+  $("#groqHint").textContent = g.configured ? `(${g.source === "ui" ? "saved" : ".env"} ${g.masked})` : "(not set)";
+  $("#kGroq").value = ""; $("#keysMsg").textContent = ""; $("#keysModal").classList.remove("hidden");
 }
 $("#btnKeys").addEventListener("click", openKeys);
 $("#keysCancel").addEventListener("click", () => $("#keysModal").classList.add("hidden"));
 $("#keysSave").addEventListener("click", async () => {
-  const body = {}; if ($("#kGroq").value.trim()) body.GROQ_API_KEY = $("#kGroq").value;
-  await fetch("/api/settings", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
-  $("#keysModal").classList.add("hidden");
+  const v = $("#kGroq").value.trim();
+  if (!v) { $("#keysModal").classList.add("hidden"); return; }
+  const res = await api("api/keys", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ groq_api_key: v }) });
+  if (res.ok) { $("#keysModal").classList.add("hidden"); loadInfo(); } else $("#keysMsg").textContent = (await res.json()).error;
+});
+$("#keysRemove").addEventListener("click", async () => {
+  const res = await api("api/keys/groq", { method: "DELETE" });
+  if (res.ok) { $("#keysModal").classList.add("hidden"); loadInfo(); } else $("#keysMsg").textContent = (await res.json()).error;
 });
 
+/* ---------- app info + saved samples ---------- */
+async function loadInfo() {
+  try {
+    INFO = await apiJson("api/info");
+    $("#btnKeys").classList.toggle("hidden", INFO.mode === "demo");
+    if (INFO.mode !== "demo" && !INFO.ai.ready) $("#btnKeys").textContent = "API Keys — add your key";
+    else $("#btnKeys").textContent = "API Keys";
+  } catch { /* ignore */ }
+}
+async function loadSamples() {
+  try {
+    const list = (await apiJson("api/samples")).samples;
+    $("#samples").innerHTML = list.map((x) => `<button class="preset" data-sid="${esc(x.id)}"><b>Sample: ${esc(x.title)}</b><span>Saved result, shown instantly</span></button>`).join("");
+    document.querySelectorAll("[data-sid]").forEach((b) => b.addEventListener("click", async () => {
+      const x = await apiJson("api/samples/" + b.dataset.sid);
+      if (!x.result) return;
+      current = x.result; $("#city").value = x.input_text; $("#profile").value = x.profile;
+      $("#pipeline").classList.add("hidden"); $("#alert").classList.add("hidden"); $("#empty").classList.add("hidden"); render(current);
+    }));
+  } catch { /* ignore */ }
+}
+
+loadInfo(); loadSamples();
 loadQuota();
 (async () => {
   const q = new URLSearchParams(location.search);
   if (q.get("city")) { $("#city").value = q.get("city"); if (q.get("profile")) $("#profile").value = q.get("profile"); return; }
   try {
-    const h = await (await fetch("/api/history?limit=1")).json();
-    if (h.length) { current = await (await fetch("/api/forecast/" + h[0].id)).json(); render(current); }
+    const h = await apiJson("api/history?limit=1");
+    if (h.length) { current = await apiJson("api/forecast/" + h[0].id); render(current); }
   } catch { /* ignore */ }
 })();

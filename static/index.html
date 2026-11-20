@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>AeroPulse — Air Quality &amp; Respiratory Advisory</title>
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%231C1917'/%3E%3Cpath d='M5 17h5l3-8 5 14 3-9 2 3h4' stroke='%2310B981' stroke-width='2.5' fill='none' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E">
-<link rel="stylesheet" href="/static/css/style.css">
+<link rel="stylesheet" href="static/css/style.css">
 </head>
 <body>
 <header class="topbar">
@@ -40,6 +40,7 @@
         <div class="timer"><span id="timer" class="mono">0.0s</span></div>
       </form>
       <div class="presets" id="presets"></div>
+      <div class="presets" id="samples" aria-label="Saved sample forecasts"></div>
     </div>
 
     <div id="pipeline" class="card pipeline hidden"></div>
@@ -119,12 +120,13 @@
 <div class="modal hidden" id="keysModal">
   <div class="modalBox">
     <h3>API Keys (BYOK)</h3>
-    <p class="muted small">Stored in the local SQLite <code>settings</code> table; <code>.env</code> is used as fallback. Leave blank to keep the current value. Without keys, a deterministic rules-based advisory is used.</p>
+    <p class="muted small">Free key at <a href="https://console.groq.com/keys" target="_blank" rel="noopener">console.groq.com/keys</a>. Saved in the local database on this computer; <code>GROQ_API_KEY</code> in <code>.env</code> is used if nothing is saved. Without a key, a rules-based advisory is shown instead of AI.</p>
     <label for="kGroq">Groq API Key <span id="groqHint" class="muted"></span></label><input id="kGroq" type="password" placeholder="gsk_...">
-    <div class="modalActions"><button class="btn ghost" id="keysCancel">Cancel</button><button class="btn primary" id="keysSave">Save</button></div>
+    <div id="keysMsg" class="muted small"></div>
+    <div class="modalActions"><button class="btn ghost" id="keysRemove">Remove saved key</button><button class="btn ghost" id="keysCancel">Cancel</button><button class="btn primary" id="keysSave">Save</button></div>
   </div>
 </div>
 
-<script src="/static/js/app.js"></script>
+<script src="static/js/app.js"></script>
 </body>
 </html>

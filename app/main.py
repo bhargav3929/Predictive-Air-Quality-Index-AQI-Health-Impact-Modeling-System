@@ -1,30 +1,108 @@
-"""AeroPulse FastAPI app — http://127.0.0.1:8004"""
+"""AeroPulse FastAPI app. Port comes from .env (PORT, default 8004)."""
 import json
+import logging
 from contextlib import asynccontextmanager
-from pathlib import Path
 
-from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi import FastAPI, Request
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
+from starlette.exceptions import HTTPException as StarletteHTTPException
 
-BASE = Path(__file__).resolve().parent.parent
-load_dotenv(BASE / ".env")
+from . import config, db, pipeline
+from .tickets import verify_ticket
 
-from . import db, pipeline  # noqa: E402
+BASE = config.BASE
+SAMPLES = BASE / "samples"
+log = logging.getLogger("aeropulse")
 
-PORT = 8004
+TICKET_STATUS = {"TICKET_REQUIRED": 401, "TICKET_INVALID": 401, "TICKET_EXPIRED": 401,
+                 "TICKET_USED_UP": 429, "DAILY_CAP_REACHED": 429}
+TICKET_MSG = {
+    "TICKET_REQUIRED": "Sign in on lastsem.com to try your own input.",
+    "TICKET_INVALID": "This demo ticket isn't valid. Go back to lastsem.com and start again.",
+    "TICKET_EXPIRED": "This demo ticket has expired. Go back to lastsem.com and start again.",
+    "TICKET_USED_UP": "You've used all live runs on this ticket. Sample forecasts are still available.",
+    "DAILY_CAP_REACHED": "The demo has reached its daily limit. Try again tomorrow or use the samples.",
+}
+
+
+class AppError(Exception):
+    def __init__(self, status: int, code: str, message: str):
+        self.status, self.code, self.message = status, code, message
 
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     db.init()
+    if config.DEMO_MODE and not config.DEMO_TICKET_SECRET:
+        log.warning("DEMO_MODE is on but DEMO_TICKET_SECRET is empty: every ticket is invalid, samples only.")
     yield
 
 
 app = FastAPI(title="AeroPulse", lifespan=lifespan)
 app.mount("/static", StaticFiles(directory=BASE / "static"), name="static")
+
+
+def _err(status: int, code: str, message: str):
+    return JSONResponse({"error": message, "code": code}, status_code=status)
+
+
+@app.exception_handler(AppError)
+async def _app_error(_: Request, e: AppError):
+    return _err(e.status, e.code, e.message)
+
+
+@app.exception_handler(StarletteHTTPException)
+async def _http_error(_: Request, e: StarletteHTTPException):
+    if e.status_code == 404:
+        return _err(404, "NOT_FOUND", "That page or record was not found.")
+    return _err(e.status_code, "BAD_INPUT", str(e.detail))
+
+
+@app.exception_handler(RequestValidationError)
+async def _validation_error(_: Request, e: RequestValidationError):
+    return _err(400, "BAD_INPUT", "The request was missing a valid field. Check your input and try again.")
+
+
+@app.exception_handler(Exception)
+async def _unhandled(_: Request, e: Exception):
+    log.exception("unhandled error")
+    return _err(500, "AI_FAILED", "Something went wrong on the server. Please try again.")
+
+
+# ---------------------------------------------------------------- helpers
+def client_ip(request: Request) -> str:
+    if config.TRUST_PROXY and config.DEMO_MODE:
+        xff = request.headers.get("x-forwarded-for", "")
+        if xff.strip():
+            return xff.split(",")[0].strip()
+    return request.client.host if request.client else "unknown"
+
+
+def _ticket(request: Request):
+    return verify_ticket(request.headers.get("x-lastsem-ticket"), config.DEMO_TICKET_SECRET, config.PROJECT_SLUG)
+
+
+def owner_of(request: Request) -> str:
+    """Download version: one shared local history (''). Demo: private per ticket id."""
+    if not config.DEMO_MODE:
+        return ""
+    payload, code = _ticket(request)
+    return payload["tid"] if payload else "-none-"
+
+
+def require_local_change(request: Request):
+    peer = request.client.host if request.client else ""
+    if peer not in ("127.0.0.1", "::1", "localhost") or request.headers.get("x-forwarded-for") \
+            or request.headers.get("forwarded"):
+        raise AppError(403, "KEYS_LOCAL_ONLY", "API keys can only be changed from the computer running the app.")
+
+
+def keys_enabled():
+    if config.DEMO_MODE:
+        raise AppError(404, "NOT_FOUND", "That page or record was not found.")
 
 
 class ForecastReq(BaseModel):
@@ -33,74 +111,169 @@ class ForecastReq(BaseModel):
 
 
 class KeysReq(BaseModel):
-    GROQ_API_KEY: str | None = None
+    groq_api_key: str
 
 
-def _ip(request: Request) -> str:
-    return request.client.host if request.client else "unknown"
-
-
+# ---------------------------------------------------------------- standard routes
 @app.get("/")
 async def index():
     return FileResponse(BASE / "static" / "index.html")
 
 
+@app.get("/health")
+async def health():
+    return {"status": "ok"}
+
+
+@app.get("/api/info")
+async def info(request: Request):
+    key, _src = db.resolve_groq_key()
+    demo = None
+    if config.DEMO_MODE:
+        payload, _code = _ticket(request)
+        runs_left = max(0, int(payload.get("runs", 0)) - db.ticket_runs(payload["tid"])) if payload else 0
+        demo = {"ticket_valid": bool(payload), "runs_left": runs_left,
+                "daily_cap_reached": db.daily_runs() >= config.DEMO_DAILY_CAP}
+    return {
+        "name": config.PROJECT_NAME, "slug": config.PROJECT_SLUG, "number": config.PROJECT_NUMBER,
+        "version": config.VERSION, "mode": "demo" if config.DEMO_MODE else "local",
+        "ai": {"provider": "groq", "ready": bool(key), "model": config.GROQ_MODEL},
+        "limits": {"max_upload_mb": config.DEMO_MAX_UPLOAD_MB if config.DEMO_MODE else config.MAX_UPLOAD_MB,
+                   "forecasts_per_hour": db.RATE_LIMIT},
+        "demo": demo,
+    }
+
+
+def _sample_list():
+    out = []
+    for f in sorted(SAMPLES.glob("*.json")):
+        try:
+            out.append(json.loads(f.read_text(encoding="utf-8")))
+        except Exception:
+            continue
+    return out
+
+
+@app.get("/api/samples")
+async def samples():
+    return {"samples": [
+        {"id": s["id"], "title": s["title"], "input_text": s["input_text"], "profile": s["profile"],
+         "has_saved_result": (SAMPLES / "results" / f"{s['id']}.json").is_file()}
+        for s in _sample_list()]}
+
+
+@app.get("/api/samples/{sid}")
+async def sample(sid: str):
+    s = next((x for x in _sample_list() if x["id"] == sid), None)
+    if not s:
+        raise AppError(404, "NOT_FOUND", "That sample doesn't exist.")
+    rf = SAMPLES / "results" / f"{sid}.json"
+    result = json.loads(rf.read_text(encoding="utf-8")) if rf.is_file() else None
+    return {**s, "result": result}
+
+
+@app.get("/api/keys")
+async def get_keys():
+    keys_enabled()
+    key, src = db.resolve_groq_key()
+    return {"groq": {"configured": bool(key), "source": src, "masked": config.mask(key) if key else ""}}
+
+
+@app.post("/api/keys")
+async def save_keys(req: KeysReq, request: Request):
+    keys_enabled()
+    require_local_change(request)
+    k = req.groq_api_key.strip()
+    if not config.key_usable(k):
+        raise AppError(400, "BAD_INPUT", "That doesn't look like a Groq key. It should start with gsk_ and have no spaces.")
+    db.set_setting("GROQ_API_KEY", k)
+    return {"saved": ["groq"]}
+
+
+@app.delete("/api/keys/groq")
+async def delete_key(request: Request):
+    keys_enabled()
+    require_local_change(request)
+    db.delete_setting("GROQ_API_KEY")
+    return {"removed": "groq"}
+
+
+# ---------------------------------------------------------------- feature routes
 @app.get("/api/quota")
 async def quota(request: Request):
-    return db.rate_status(_ip(request))
+    return db.rate_status(client_ip(request))
 
 
 @app.post("/api/forecast")
 async def forecast(req: ForecastReq, request: Request):
-    allowed, remaining, reset = db.rate_hit(_ip(request))
+    ticket = None
+    if config.DEMO_MODE:
+        ticket, code = _ticket(request)
+        if not ticket:
+            raise AppError(TICKET_STATUS[code], code, TICKET_MSG[code])
+        if db.ticket_runs(ticket["tid"]) >= int(ticket.get("runs", 0)):
+            raise AppError(429, "TICKET_USED_UP", TICKET_MSG["TICKET_USED_UP"])
+        if db.daily_runs() >= config.DEMO_DAILY_CAP:
+            raise AppError(429, "DAILY_CAP_REACHED", TICKET_MSG["DAILY_CAP_REACHED"])
+
+    ip = client_ip(request)
+    allowed, remaining, reset = db.rate_hit(ip)
+    if not allowed:
+        raise AppError(429, "RATE_LIMITED",
+                       f"Free demo limit reached ({db.RATE_LIMIT}/hour). Try again in {reset // 60 + 1} min.")
+    owner = ticket["tid"] if ticket else ""
+    key, _src = db.resolve_groq_key()
 
     async def gen():
         refunded = False
         rem = remaining
-        if not allowed:
-            yield json.dumps({"type": "error", "code": "rate_limited", "remaining": 0,
-                              "message": f"Free demo limit reached (15/hour). Try again in {reset // 60 + 1} min."}) + "\n"
-            return
-        async for ev in pipeline.run(req.city, req.profile):
-            if ev["type"] == "error" and ev.get("node") in (1, 2) and not refunded:
-                db.rate_refund(_ip(request))  # failed lookups don't consume quota
+
+        def refund():
+            nonlocal refunded, rem
+            if not refunded:  # failed runs never count against the limit
+                db.rate_refund(ip)
                 refunded = True
                 rem = min(db.RATE_LIMIT, rem + 1)
+
+        async for ev in pipeline.run(req.city, req.profile, owner, key):
+            if ev["type"] == "error" and not refunded:
+                refund()
+            elif ev["type"] == "result":
+                if ev["data"]["provider"].get("error_code"):
+                    refund()
+                elif ticket:
+                    db.record_run(ticket["tid"])
             ev["quota_remaining"] = rem
             yield json.dumps(ev, ensure_ascii=False) + "\n"
 
     return StreamingResponse(gen(), media_type="application/x-ndjson")
 
 
-@app.get("/api/health")
-async def health():
-    return {"status": "ok", "port": PORT}
-
-
 @app.delete("/api/forecast/{fid}")
-async def delete_forecast(fid: int):
-    db.delete_forecast(fid)
+async def delete_forecast(fid: int, request: Request):
+    db.delete_forecast(fid, owner_of(request))
     return {"deleted": fid}
 
 
 @app.get("/api/history")
-async def history(limit: int = 50):
-    return db.list_forecasts(max(1, min(limit, 200)))
+async def history(request: Request, limit: int = 50):
+    return db.list_forecasts(max(1, min(limit, 200)), owner_of(request))
 
 
 @app.get("/api/forecast/{fid}")
-async def get_forecast(fid: int):
-    f = db.get_forecast(fid)
+async def get_forecast(fid: int, request: Request):
+    f = db.get_forecast(fid, owner_of(request))
     if not f:
-        raise HTTPException(404, "Forecast not found")
+        raise AppError(404, "NOT_FOUND", "Forecast not found.")
     return f
 
 
 @app.get("/api/compare")
-async def compare(a: int, b: int):
-    fa, fb = db.get_forecast(a), db.get_forecast(b)
+async def compare(a: int, b: int, request: Request):
+    owner = owner_of(request)
+    fa, fb = db.get_forecast(a, owner), db.get_forecast(b, owner)
     if not fa or not fb:
-        raise HTTPException(404, "Forecast not found")
+        raise AppError(404, "NOT_FOUND", "Forecast not found.")
     keys = ["us_aqi", "pm2_5", "pm10", "no2", "o3"]
     delta = {k: (None if fa["current"].get(k) is None or fb["current"].get(k) is None
                  else round(fb["current"][k] - fa["current"][k], 1)) for k in keys}
@@ -116,21 +289,6 @@ async def compare(a: int, b: int):
     return {"a": summ(fa), "b": summ(fb), "delta_b_minus_a": delta, "recommendation": rec}
 
 
-@app.get("/api/settings")
-async def get_settings():
-    k = db.get_keys()
-    return {n: {"set": bool(v), "hint": ("…" + v[-4:]) if v else ""} for n, v in k.items()}
-
-
-@app.post("/api/settings")
-async def save_settings(req: KeysReq):
-    for name in ("GROQ_API_KEY",):
-        v = getattr(req, name)
-        if v is not None:
-            db.set_setting(name, v.strip())
-    return await get_settings()
-
-
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("app.main:app", host="127.0.0.1", port=PORT)
+    uvicorn.run("app.main:app", host=config.HOST, port=config.PORT)

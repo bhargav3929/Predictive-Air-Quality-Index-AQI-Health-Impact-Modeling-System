@@ -1,5 +1,13 @@
+.env
 .venv/
+venv/
 __pycache__/
 *.pyc
-.env
-aeropulse.db*
+*.db
+*.db-*
+*.db*
+*.sqlite
+data/
+.DS_Store
+.idea/
+.vscode/
