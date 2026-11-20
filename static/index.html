@@ -1,0 +1,130 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AeroPulse — Air Quality &amp; Respiratory Advisory</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%231C1917'/%3E%3Cpath d='M5 17h5l3-8 5 14 3-9 2 3h4' stroke='%2310B981' stroke-width='2.5' fill='none' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E">
+<link rel="stylesheet" href="/static/css/style.css">
+</head>
+<body>
+<header class="topbar">
+  <div class="brand">
+    <svg viewBox="0 0 32 32" width="28" height="28"><rect width="32" height="32" rx="8" fill="#1C1917"/><path d="M5 17h5l3-8 5 14 3-9 2 3h4" stroke="#10B981" stroke-width="2.5" fill="none" stroke-linecap="round" stroke-linejoin="round"/></svg>
+    <span>AeroPulse</span>
+  </div>
+  <nav class="tabs" role="tablist">
+    <button class="tab active" data-view="forecast">Live Forecast &amp; Advisory</button>
+    <button class="tab" data-view="compare">City vs. City Compare</button>
+    <button class="tab" data-view="brief">Clinical Health Brief</button>
+  </nav>
+  <div class="actions">
+    <span class="pill" id="quotaPill">15/15 Free Demo Forecasts Left This Hour</span>
+    <button class="btn ghost" id="btnHistory">Forecast History</button>
+    <button class="btn ghost" id="btnKeys">API Keys</button>
+  </div>
+</header>
+
+<main>
+  <!-- ============ VIEW 1 ============ -->
+  <section class="view active" id="view-forecast">
+    <div class="card controls">
+      <form id="form" autocomplete="off">
+        <div class="field grow"><label for="city">City</label><input id="city" placeholder="e.g. New Delhi" value="" required></div>
+        <div class="field"><label for="profile">Health profile</label>
+          <select id="profile">
+            <option>General Adult</option><option>Asthma / Respiratory</option>
+            <option>Elderly / Cardiac</option><option>Children / Outdoor Athletics</option>
+          </select></div>
+        <button class="btn primary" id="btnRun" type="submit">Run Forecast</button>
+        <div class="timer"><span id="timer" class="mono">0.0s</span></div>
+      </form>
+      <div class="presets" id="presets"></div>
+    </div>
+
+    <div id="pipeline" class="card pipeline hidden"></div>
+    <div id="alert" class="alert hidden"></div>
+
+    <div id="empty" class="card empty">
+      <h2>Atmospheric &amp; Clinical Advisory Console</h2>
+      <p>Pick a preset above or enter any city to pull live Open-Meteo telemetry, a 72-hour AQI outlook and a profile-specific respiratory advisory.</p>
+    </div>
+
+    <div id="results" class="hidden">
+      <div class="grid hero">
+        <div class="card gaugeCard">
+          <div class="cardTitle" id="locTitle"></div>
+          <div id="gauge"></div>
+          <div class="riskRow"><span class="muted small">Personal Exposure Index</span> <b class="mono" id="riskIdx"></b></div>
+          <div class="heroMeta"><span class="badge" id="catBadge"></span><span class="badge outline" id="domBadge"></span><span class="badge outline" id="trendBadge"></span></div>
+        </div>
+        <div class="metrics" id="metrics"></div>
+      </div>
+
+      <div class="card">
+        <div class="cardTitle">72-Hour US AQI &amp; PM2.5 Forecast <span class="legend"><i class="ln aqi"></i>US AQI <i class="ln pm"></i>PM2.5 (µg/m³)</span></div>
+        <div class="chartWrap"><div id="chart"></div><div id="tip" class="tip hidden"></div></div>
+        <div class="grid two" id="windows"></div>
+      </div>
+
+      <div class="card"><div class="cardTitle">Hourly Exposure Strip <span class="legend muted">each cell = 1 hour · faded = past · outlined = now</span></div><div id="strip" class="strip"></div></div>
+      <div class="card"><div class="cardTitle">Window Statistics</div><div id="stats" class="tableWrap"></div></div>
+
+      <div class="cardTitle section" id="advTitle">Respiratory Health Advisory</div>
+      <div class="grid three" id="advisory"></div>
+    </div>
+
+    <details class="card logs" id="logs">
+      <summary>Execution &amp; Debug Logs</summary>
+      <div id="logSummary" class="mono small"></div>
+      <pre id="logRaw" class="mono small"></pre>
+    </details>
+  </section>
+
+  <!-- ============ VIEW 2 ============ -->
+  <section class="view" id="view-compare">
+    <div class="card controls">
+      <div class="compareSel">
+        <div class="field grow"><label>City A</label><select id="cmpA"></select></div>
+        <div class="vs">vs</div>
+        <div class="field grow"><label>City B</label><select id="cmpB"></select></div>
+        <button class="btn primary" id="btnCompare">Compare</button>
+      </div>
+      <p class="muted small">Compare any two forecasts saved in SQLite. Run at least two forecasts first.</p>
+    </div>
+    <div id="cmpOut"></div>
+    <div id="cmpChartCard" class="card hidden"><div class="cardTitle">72-Hour US AQI Overlay <span class="legend"><i class="ln"></i><span id="lgA"></span> <i class="ln" style="border-top-color:#2563EB"></i><span id="lgB"></span></span></div><div id="cmpChart"></div></div>
+  </section>
+
+  <!-- ============ VIEW 3 ============ -->
+  <section class="view" id="view-brief">
+    <div class="card">
+      <div class="briefBar">
+        <div class="cardTitle" style="margin:0">Public Health &amp; Respiratory Exposure Brief</div>
+        <div><button class="btn" id="btnCopy">Copy Brief</button> <button class="btn primary" id="btnDownload">Download Report (.md)</button> <button class="btn ghost" onclick="window.print()">Print</button></div>
+      </div>
+      <pre id="briefText" class="brief mono">Run a forecast to generate the clinical brief.</pre>
+    </div>
+  </section>
+</main>
+
+<!-- History drawer -->
+<div class="scrim hidden" id="scrim"></div>
+<aside class="drawer" id="drawer">
+  <div class="drawerHead"><b>Forecast History</b><button class="btn ghost" id="closeDrawer">Close</button></div>
+  <div id="historyList"></div>
+</aside>
+
+<!-- Keys modal -->
+<div class="modal hidden" id="keysModal">
+  <div class="modalBox">
+    <h3>API Keys (BYOK)</h3>
+    <p class="muted small">Stored in the local SQLite <code>settings</code> table; <code>.env</code> is used as fallback. Leave blank to keep the current value. Without keys, a deterministic rules-based advisory is used.</p>
+    <label for="kGroq">Groq API Key <span id="groqHint" class="muted"></span></label><input id="kGroq" type="password" placeholder="gsk_...">
+    <div class="modalActions"><button class="btn ghost" id="keysCancel">Cancel</button><button class="btn primary" id="keysSave">Save</button></div>
+  </div>
+</div>
+
+<script src="/static/js/app.js"></script>
+</body>
+</html>
