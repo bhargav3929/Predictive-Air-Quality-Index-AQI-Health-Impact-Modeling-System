@@ -42,7 +42,6 @@ DEMO_TICKET_SECRET = os.getenv("DEMO_TICKET_SECRET", "").strip()
 DEMO_DAILY_CAP = _int("DEMO_DAILY_CAP", 200)
 DEMO_MAX_UPLOAD_MB = _int("DEMO_MAX_UPLOAD_MB", 3)
 TRUST_PROXY = _bool("TRUST_PROXY", False)
-HOURLY_QUOTA = _int("HOURLY_QUOTA", 15)
 
 
 def key_usable(k: str | None) -> bool:

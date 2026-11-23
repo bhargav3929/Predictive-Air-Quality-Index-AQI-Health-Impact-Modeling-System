@@ -13,14 +13,14 @@ AeroPulse turns live air-quality data into a 72-hour forecast and a profile-spec
 ## Design decisions to explain
 - **Groq only.** One module (`app/llm.py`): 40 s timeout, 3 attempts per model with 1/2/4 s backoff, honours "try again in Xs", falls back to `GROQ_FALLBACK_MODEL`, turns failures into plain messages (`AI_NOT_CONFIGURED`, `AI_KEY_INVALID`, `AI_BUSY`, `AI_FAILED`).
 - **Key handling.** A key counts only if it starts with `gsk_` and is not the placeholder. Saved key first, then `.env`. Changes are accepted only from the same machine (no `X-Forwarded-For`). The key is never sent back unmasked.
-- **Failed runs are free.** The hourly quota (15 per IP, sliding window in SQLite) is refunded when geocoding, telemetry or the AI fails.
+- **Failed runs are free.** A demo ticket run is counted only after a forecast succeeds.
 - **Same codebase, two versions.** `DEMO_MODE` switches on signed-ticket checks, a daily cap, per-visitor history and hides the keys screen. The student download keeps it off.
 - **Relative URLs.** The frontend calls `api/...` so it works under a sub-path.
 - **Windows-safe.** Pure-Python packages only (`fastapi`, `uvicorn`, `httpx`, `python-dotenv`, `python-multipart`) and `python -m uvicorn`, so no blocked compiled DLLs.
 - **Samples.** `samples/` holds inputs; `samples/results/` holds saved output of real runs, shown instantly without calling Groq.
 
 ## Standard routes
-`GET /health`, `GET /api/info`, `GET /api/samples`, `GET /api/samples/{id}`, `GET/POST /api/keys`, `DELETE /api/keys/groq`. Feature routes: `POST /api/forecast` (stream), `GET /api/history`, `GET /api/forecast/{id}`, `GET /api/compare`, `GET /api/quota`. Errors always look like `{"error": "...", "code": "..."}`.
+`GET /health`, `GET /api/info`, `GET /api/samples`, `GET /api/samples/{id}`, `GET/POST /api/keys`, `DELETE /api/keys/groq`. Feature routes: `POST /api/forecast` (stream), `GET /api/history`, `GET /api/forecast/{id}`, `GET /api/compare`. Errors always look like `{"error": "...", "code": "..."}`.
 
 ## Likely questions
 - *Why is it not a medical device?* It gives general guidance from public data; the brief says so.

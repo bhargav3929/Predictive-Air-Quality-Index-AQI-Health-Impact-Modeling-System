@@ -10,7 +10,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
-from . import config, db, pipeline
+from . import config, db, llm, pipeline
 from .tickets import verify_ticket
 
 BASE = config.BASE
@@ -58,7 +58,11 @@ async def _app_error(_: Request, e: AppError):
 async def _http_error(_: Request, e: StarletteHTTPException):
     if e.status_code == 404:
         return _err(404, "NOT_FOUND", "That page or record was not found.")
-    return _err(e.status_code, "BAD_INPUT", str(e.detail))
+    if e.status_code == 413:
+        return _err(413, "TOO_LARGE", "That input is too large.")
+    if e.status_code < 500:
+        return _err(e.status_code, "BAD_INPUT", "That request isn't valid. Check it and try again.")
+    return _err(502, "AI_FAILED", "Something went wrong on the server. Please try again.")
 
 
 @app.exception_handler(RequestValidationError)
@@ -69,18 +73,10 @@ async def _validation_error(_: Request, e: RequestValidationError):
 @app.exception_handler(Exception)
 async def _unhandled(_: Request, e: Exception):
     log.exception("unhandled error")
-    return _err(500, "AI_FAILED", "Something went wrong on the server. Please try again.")
+    return _err(502, "AI_FAILED", "Something went wrong on the server. Please try again.")
 
 
 # ---------------------------------------------------------------- helpers
-def client_ip(request: Request) -> str:
-    if config.TRUST_PROXY and config.DEMO_MODE:
-        xff = request.headers.get("x-forwarded-for", "")
-        if xff.strip():
-            return xff.split(",")[0].strip()
-    return request.client.host if request.client else "unknown"
-
-
 def _ticket(request: Request):
     return verify_ticket(request.headers.get("x-lastsem-ticket"), config.DEMO_TICKET_SECRET, config.PROJECT_SLUG)
 
@@ -138,8 +134,7 @@ async def info(request: Request):
         "name": config.PROJECT_NAME, "slug": config.PROJECT_SLUG, "number": config.PROJECT_NUMBER,
         "version": config.VERSION, "mode": "demo" if config.DEMO_MODE else "local",
         "ai": {"provider": "groq", "ready": bool(key), "model": config.GROQ_MODEL},
-        "limits": {"max_upload_mb": config.DEMO_MAX_UPLOAD_MB if config.DEMO_MODE else config.MAX_UPLOAD_MB,
-                   "forecasts_per_hour": db.RATE_LIMIT},
+        "limits": {"max_upload_mb": config.DEMO_MAX_UPLOAD_MB if config.DEMO_MODE else config.MAX_UPLOAD_MB},
         "demo": demo,
     }
 
@@ -199,11 +194,6 @@ async def delete_key(request: Request):
 
 
 # ---------------------------------------------------------------- feature routes
-@app.get("/api/quota")
-async def quota(request: Request):
-    return db.rate_status(client_ip(request))
-
-
 @app.post("/api/forecast")
 async def forecast(req: ForecastReq, request: Request):
     ticket = None
@@ -216,34 +206,18 @@ async def forecast(req: ForecastReq, request: Request):
         if db.daily_runs() >= config.DEMO_DAILY_CAP:
             raise AppError(429, "DAILY_CAP_REACHED", TICKET_MSG["DAILY_CAP_REACHED"])
 
-    ip = client_ip(request)
-    allowed, remaining, reset = db.rate_hit(ip)
-    if not allowed:
-        raise AppError(429, "RATE_LIMITED",
-                       f"Free demo limit reached ({db.RATE_LIMIT}/hour). Try again in {reset // 60 + 1} min.")
     owner = ticket["tid"] if ticket else ""
     key, _src = db.resolve_groq_key()
+    if not key:
+        msg = ("The demo AI is not available right now. The samples still work." if config.DEMO_MODE
+               else llm.MESSAGES["AI_NOT_CONFIGURED"])
+        raise AppError(503, "AI_NOT_CONFIGURED", msg)
 
     async def gen():
-        refunded = False
-        rem = remaining
-
-        def refund():
-            nonlocal refunded, rem
-            if not refunded:  # failed runs never count against the limit
-                db.rate_refund(ip)
-                refunded = True
-                rem = min(db.RATE_LIMIT, rem + 1)
-
+        # A run is recorded against a demo ticket only after it succeeds.
         async for ev in pipeline.run(req.city, req.profile, owner, key):
-            if ev["type"] == "error" and not refunded:
-                refund()
-            elif ev["type"] == "result":
-                if ev["data"]["provider"].get("error_code"):
-                    refund()
-                elif ticket:
-                    db.record_run(ticket["tid"])
-            ev["quota_remaining"] = rem
+            if ev["type"] == "result" and ticket and not ev["data"]["provider"].get("error_code"):
+                db.record_run(ticket["tid"])
             yield json.dumps(ev, ensure_ascii=False) + "\n"
 
     return StreamingResponse(gen(), media_type="application/x-ndjson")

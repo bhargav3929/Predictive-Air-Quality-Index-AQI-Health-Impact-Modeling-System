@@ -14,19 +14,19 @@ AeroPulse takes a city name and a health profile (for example "Asthma / Respirat
 The first run installs everything and creates a `.env` file for you. Your browser then opens at **http://127.0.0.1:8004**. The next runs start in seconds.
 
 ## Add your Groq key
-Click **API Keys** in the app and paste your key, or put it in `.env` as `GROQ_API_KEY=gsk_...`. Without a key the app still works, but it shows a simple rules-based advisory instead of an AI one.
+Click **API Keys** in the app and paste your key, or put it in `.env` as `GROQ_API_KEY=gsk_...`. Without a key the app asks you to add one before it runs a live forecast. The saved samples still open without a key.
 
 ## How to use it
 1. Click one of the **Sample** buttons. A saved forecast appears instantly.
 2. Click a city preset (New Delhi, Hyderabad, Zurich, Beijing) to run a live forecast.
 3. Or type any city, pick a health profile and press **Run Forecast**.
 4. Use the tabs: **Live Forecast & Advisory**, **City vs. City Compare** (needs two forecasts), and **Clinical Health Brief** (copy or download a `.md` report).
-5. **Forecast History** lists your earlier forecasts. The free quota is 15 forecasts per hour.
+5. **Forecast History** lists your earlier forecasts.
 
 ## How it works
 City name → **geocoder** (Open-Meteo) → **live air-quality data** (US AQI, PM2.5, PM10, NO2, O3) → **72-hour trend and peak-window analysis** → **Groq AI advisory** → **SQLite save and health brief**.
 - The AI tries `GROQ_MODEL` first, then `GROQ_FALLBACK_MODEL`. Busy or slow answers are retried automatically.
-- If the AI cannot answer, you get the rules-based advisory and the run is not counted against your quota.
+- If the AI is busy or fails, you still get a simple rules-based advisory with a clear message saying so.
 
 Main files: `app/main.py` (routes), `app/pipeline.py` (the 5 steps), `app/llm.py` (Groq calls), `app/db.py` (SQLite), `app/config.py` (settings).
 
@@ -44,15 +44,20 @@ samples/               sample inputs; samples/results/ has their saved results
 
 ## Troubleshooting
 - **Port already in use:** another program is using 8004. Close it, or change `PORT` in `.env` and run the start script again.
-- **"AI service is busy":** the free Groq service is overloaded. Wait a minute and try again. Nothing is counted against your quota.
+- **"AI service is busy":** the free Groq service is overloaded. Wait a minute and try again.
 - **"Your Groq key was rejected":** open **API Keys** and paste a fresh key from https://console.groq.com/keys.
 - **Python not found:** install Python 3.10+ from https://www.python.org/downloads/, then run the start script again.
 - **Install failed:** check your internet connection and run the start script again. It resumes where it stopped.
 
-Run the commands:
+## Run it by hand (optional)
+If you prefer typing the commands yourself:
 
-Windows (PowerShell):
+**Windows (PowerShell):**
+```
 python -m venv .venv; .\.venv\Scripts\python.exe -m pip install -r requirements.txt; .\.venv\Scripts\python.exe -m uvicorn app.main:app --host 127.0.0.1 --port 8004
+```
 
-macOS / Linux (Terminal):
+**macOS / Linux (Terminal):**
+```
 python3 -m venv .venv && ./.venv/bin/python -m pip install -r requirements.txt && ./.venv/bin/python -m uvicorn app.main:app --host 127.0.0.1 --port 8004
+```

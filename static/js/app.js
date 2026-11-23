@@ -45,16 +45,6 @@ function switchView(v) {
   if (v === "compare") loadCompareOptions();
 }
 
-/* ---------- quota ---------- */
-async function loadQuota() {
-  try { setQuota((await apiJson("api/quota")).remaining); } catch { /* ignore */ }
-}
-function setQuota(n) {
-  const p = $("#quotaPill");
-  p.textContent = `${n}/15 Free Demo Forecasts Left This Hour`;
-  p.className = "pill" + (n === 0 ? " zero" : n <= 2 ? " low" : "");
-}
-
 /* ---------- presets ---------- */
 $("#presets").innerHTML = PRESETS.map((p, i) => `<button class="preset" data-i="${i}"><b>${esc(p.title)}</b><span>${esc(p.sub)}</span></button>`).join("");
 document.querySelectorAll(".preset").forEach((b) => b.addEventListener("click", () => {
@@ -89,8 +79,8 @@ async function runForecast(city, profile) {
     const res = await api("api/forecast", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ city, profile }) });
     if (!res.ok) {  // plain {error, code} JSON, e.g. quota reached or ticket problem
       const e = await res.json().catch(() => ({ error: "Request failed.", code: "AI_FAILED" }));
-      showAlert(e.error, e.code === "RATE_LIMITED" || e.code.startsWith("TICKET") || e.code === "DAILY_CAP_REACHED" ? "" : "err");
-      if (e.code === "RATE_LIMITED") setQuota(0);
+      showAlert(e.error, e.code.startsWith("TICKET") || e.code === "DAILY_CAP_REACHED" || e.code === "AI_NOT_CONFIGURED" ? "" : "err");
+      if (e.code === "AI_NOT_CONFIGURED" && INFO && INFO.mode !== "demo") openKeys();
       return;
     }
     const reader = res.body.getReader(); const dec = new TextDecoder(); let buf = "";
@@ -104,7 +94,6 @@ async function runForecast(city, profile) {
         if (!line) continue;
         rawLog.push(line);
         const ev = JSON.parse(line);
-        if (ev.quota_remaining != null) setQuota(ev.quota_remaining);
         if (ev.type === "node") { state[ev.node] = { status: ev.status, ms: ev.ms }; renderPipeline(state); }
         else if (ev.type === "error") {
           if (ev.node) { state[ev.node] = { status: "err" }; renderPipeline(state); }
@@ -352,7 +341,6 @@ async function loadSamples() {
 }
 
 loadInfo(); loadSamples();
-loadQuota();
 (async () => {
   const q = new URLSearchParams(location.search);
   if (q.get("city")) { $("#city").value = q.get("city"); if (q.get("profile")) $("#profile").value = q.get("profile"); return; }
